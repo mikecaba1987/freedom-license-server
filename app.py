@@ -2,10 +2,25 @@ from flask import Flask, request, jsonify
 import sqlite3
 from pathlib import Path
 from datetime import datetime
+import secrets
+import string
 
 app = Flask(__name__)
 
 DB = Path(__file__).resolve().parent / "licenses.db"
+
+
+def now():
+    return datetime.utcnow().isoformat()
+
+
+def generate_license_key():
+    alphabet = string.ascii_uppercase + string.digits
+    parts = []
+    for _ in range(4):
+        part = "".join(secrets.choice(alphabet) for _ in range(5))
+        parts.append(part)
+    return "FD-" + "-".join(parts)
 
 
 def get_db():
@@ -25,6 +40,10 @@ def init_db():
         active INTEGER DEFAULT 1,
         max_devices INTEGER DEFAULT 2,
         customer_email TEXT DEFAULT '',
+        customer_name TEXT DEFAULT '',
+        source TEXT DEFAULT '',
+        gumroad_sale_id TEXT DEFAULT '',
+        product_name TEXT DEFAULT '',
         created_at TEXT DEFAULT ''
     )
     """)
@@ -42,8 +61,76 @@ def init_db():
     conn.close()
 
 
+def create_license(
+    customer_email="",
+    customer_name="",
+    source="manual",
+    gumroad_sale_id="",
+    product_name="",
+    max_devices=2,
+):
+    init_db()
+
+    conn = get_db()
+    cur = conn.cursor()
+
+    if gumroad_sale_id:
+        cur.execute(
+            "SELECT * FROM licenses WHERE gumroad_sale_id = ?",
+            (gumroad_sale_id,)
+        )
+        existing = cur.fetchone()
+        if existing:
+            conn.close()
+            return dict(existing), False
+
+    for _ in range(20):
+        key = generate_license_key()
+
+        try:
+            cur.execute("""
+                INSERT INTO licenses (
+                    license_key,
+                    active,
+                    max_devices,
+                    customer_email,
+                    customer_name,
+                    source,
+                    gumroad_sale_id,
+                    product_name,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                key,
+                1,
+                int(max_devices),
+                customer_email,
+                customer_name,
+                source,
+                gumroad_sale_id,
+                product_name,
+                now(),
+            ))
+
+            conn.commit()
+
+            cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
+            row = cur.fetchone()
+            conn.close()
+
+            return dict(row), True
+
+        except sqlite3.IntegrityError:
+            continue
+
+    conn.close()
+    raise RuntimeError("Could not generate unique license key")
+
+
 @app.route("/", methods=["GET"])
 def home():
+    init_db()
     return jsonify({
         "name": "Freedom Downloader License Server",
         "status": "online"
@@ -120,7 +207,7 @@ def activate():
 
         cur.execute(
             "INSERT INTO activations (license_key, device_id, activated_at) VALUES (?, ?, ?)",
-            (key, device_id, datetime.utcnow().isoformat())
+            (key, device_id, now())
         )
         conn.commit()
 
@@ -168,6 +255,77 @@ def check():
         "valid": False,
         "pro": False,
         "message": "License not active on this device"
+    })
+
+
+@app.route("/admin/create-license", methods=["POST", "GET"])
+def admin_create_license():
+    data = request.get_json(silent=True) or {}
+
+    customer_email = str(data.get("customer_email", request.args.get("email", ""))).strip()
+    customer_name = str(data.get("customer_name", request.args.get("name", ""))).strip()
+
+    license_row, created = create_license(
+        customer_email=customer_email,
+        customer_name=customer_name,
+        source="manual",
+        max_devices=2,
+    )
+
+    return jsonify({
+        "created": created,
+        "license": license_row
+    })
+
+
+@app.route("/gumroad/webhook", methods=["POST"])
+def gumroad_webhook():
+    init_db()
+
+    data = request.form.to_dict()
+
+    customer_email = str(
+        data.get("email")
+        or data.get("purchaser_email")
+        or data.get("customer_email")
+        or ""
+    ).strip()
+
+    customer_name = str(
+        data.get("full_name")
+        or data.get("name")
+        or data.get("customer_name")
+        or ""
+    ).strip()
+
+    gumroad_sale_id = str(
+        data.get("sale_id")
+        or data.get("id")
+        or data.get("order_id")
+        or ""
+    ).strip()
+
+    product_name = str(
+        data.get("product_name")
+        or data.get("product_permalink")
+        or ""
+    ).strip()
+
+    license_row, created = create_license(
+        customer_email=customer_email,
+        customer_name=customer_name,
+        source="gumroad",
+        gumroad_sale_id=gumroad_sale_id,
+        product_name=product_name,
+        max_devices=2,
+    )
+
+    return jsonify({
+        "ok": True,
+        "created": created,
+        "license_key": license_row["license_key"],
+        "customer_email": customer_email,
+        "message": "License generated"
     })
 
 
