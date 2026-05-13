@@ -57,7 +57,19 @@ def init_db():
         activated_at TEXT DEFAULT ''
     )
     """)
+        columns = [row["name"] for row in cur.execute("PRAGMA table_info(licenses)").fetchall()]
 
+    if "customer_name" not in columns:
+        cur.execute("ALTER TABLE licenses ADD COLUMN customer_name TEXT DEFAULT ''")
+
+    if "source" not in columns:
+        cur.execute("ALTER TABLE licenses ADD COLUMN source TEXT DEFAULT ''")
+
+    if "gumroad_sale_id" not in columns:
+        cur.execute("ALTER TABLE licenses ADD COLUMN gumroad_sale_id TEXT DEFAULT ''")
+
+    if "product_name" not in columns:
+        cur.execute("ALTER TABLE licenses ADD COLUMN product_name TEXT DEFAULT ''")
     conn.commit()
     conn.close()
 
