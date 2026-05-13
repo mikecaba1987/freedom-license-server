@@ -57,7 +57,9 @@ def init_db():
         activated_at TEXT DEFAULT ''
     )
     """)
-        columns = [row["name"] for row in cur.execute("PRAGMA table_info(licenses)").fetchall()]
+    
+     
+    columns = [row["name"] for row in cur.execute("PRAGMA table_info(licenses)").fetchall()]
 
     if "customer_name" not in columns:
         cur.execute("ALTER TABLE licenses ADD COLUMN customer_name TEXT DEFAULT ''")
