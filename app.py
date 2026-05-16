@@ -8,7 +8,7 @@ import urllib.request
 from pathlib import Path
 from datetime import datetime
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
 
@@ -136,7 +136,6 @@ def create_license(
             ))
 
             conn.commit()
-
             cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
             row = cur.fetchone()
             conn.close()
@@ -158,6 +157,7 @@ def extract_youtube_id(url):
 
     if parsed.hostname in ["youtube.com", "www.youtube.com", "m.youtube.com"]:
         query = urllib.parse.parse_qs(parsed.query)
+
         if "v" in query:
             return query["v"][0]
 
@@ -209,13 +209,14 @@ def preview():
 
         return jsonify({
             "title": title,
-            "duration": info.get("duration", 0),
+            "duration": 0,
             "thumbnail": thumbnail,
             "video_id": video_id,
         })
 
     except Exception:
         thumbnail = ""
+
         if video_id:
             thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
@@ -225,6 +226,24 @@ def preview():
             "thumbnail": thumbnail,
             "video_id": video_id,
         })
+
+
+@app.route("/api/download-pro", methods=["GET"])
+def download_pro():
+    file_path = Path(__file__).resolve().parent / "files" / "demo.mp3"
+
+    if not file_path.exists():
+        return jsonify({
+            "error": "demo.mp3 not found",
+            "path": str(file_path),
+        }), 404
+
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name="freedom-demo.mp3",
+        mimetype="audio/mpeg",
+    )
 
 
 @app.route("/activate", methods=["POST"])
