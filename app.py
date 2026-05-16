@@ -398,8 +398,7 @@ def admin_list():
     })
 
 
-if __name__ == "__main__":
-    @app.route("/api/preview", methods=["POST"])
+@app.route("/api/preview", methods=["POST"])
 def preview():
 
     data = request.json
@@ -427,5 +426,7 @@ def preview():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+      
+        if __name__ == "__main__":
     init_db()
     app.run(host="127.0.0.1", port=5000, debug=True)
