@@ -1,11 +1,14 @@
 import os
-from flask import Flask, request, jsonify
+import json
 import sqlite3
-from pathlib import Path
-from datetime import datetime
 import secrets
 import string
-import yt_dlp
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from datetime import datetime
+
+from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
@@ -58,9 +61,11 @@ def init_db():
         activated_at TEXT DEFAULT ''
     )
     """)
-    
-     
-    columns = [row["name"] for row in cur.execute("PRAGMA table_info(licenses)").fetchall()]
+
+    columns = [
+        row["name"]
+        for row in cur.execute("PRAGMA table_info(licenses)").fetchall()
+    ]
 
     if "customer_name" not in columns:
         cur.execute("ALTER TABLE licenses ADD COLUMN customer_name TEXT DEFAULT ''")
@@ -73,6 +78,7 @@ def init_db():
 
     if "product_name" not in columns:
         cur.execute("ALTER TABLE licenses ADD COLUMN product_name TEXT DEFAULT ''")
+
     conn.commit()
     conn.close()
 
@@ -93,7 +99,7 @@ def create_license(
     if gumroad_sale_id:
         cur.execute(
             "SELECT * FROM licenses WHERE gumroad_sale_id = ?",
-            (gumroad_sale_id,)
+            (gumroad_sale_id,),
         )
         existing = cur.fetchone()
         if existing:
@@ -144,13 +150,81 @@ def create_license(
     raise RuntimeError("Could not generate unique license key")
 
 
+def extract_youtube_id(url):
+    parsed = urllib.parse.urlparse(url)
+
+    if parsed.hostname in ["youtu.be", "www.youtu.be"]:
+        return parsed.path.strip("/")
+
+    if parsed.hostname in ["youtube.com", "www.youtube.com", "m.youtube.com"]:
+        query = urllib.parse.parse_qs(parsed.query)
+        if "v" in query:
+            return query["v"][0]
+
+        if parsed.path.startswith("/shorts/"):
+            return parsed.path.split("/shorts/")[1].split("/")[0]
+
+    return ""
+
+
 @app.route("/", methods=["GET"])
 def home():
     init_db()
     return jsonify({
         "name": "Freedom Downloader License Server",
-        "status": "online"
+        "status": "online",
     })
+
+
+@app.route("/api/preview", methods=["POST"])
+def preview():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url", "")).strip()
+
+    if not url:
+        return jsonify({"error": "Missing URL"}), 400
+
+    video_id = extract_youtube_id(url)
+
+    try:
+        oembed_url = (
+            "https://www.youtube.com/oembed?format=json&url="
+            + urllib.parse.quote(url, safe="")
+        )
+
+        req = urllib.request.Request(
+            oembed_url,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+
+        with urllib.request.urlopen(req, timeout=8) as response:
+            raw = response.read().decode("utf-8")
+            info = json.loads(raw)
+
+        title = info.get("title", "YouTube Audio Preview")
+        thumbnail = info.get("thumbnail_url", "")
+
+        if not thumbnail and video_id:
+            thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+
+        return jsonify({
+            "title": title,
+            "duration": 0,
+            "thumbnail": thumbnail,
+            "video_id": video_id,
+        })
+
+    except Exception:
+        thumbnail = ""
+        if video_id:
+            thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+
+        return jsonify({
+            "title": "YouTube Audio Preview",
+            "duration": 0,
+            "thumbnail": thumbnail,
+            "video_id": video_id,
+        })
 
 
 @app.route("/activate", methods=["POST"])
@@ -166,14 +240,14 @@ def activate():
         return jsonify({
             "valid": False,
             "pro": False,
-            "message": "Missing license key"
+            "message": "Missing license key",
         }), 400
 
     if not device_id:
         return jsonify({
             "valid": False,
             "pro": False,
-            "message": "Missing device ID"
+            "message": "Missing device ID",
         }), 400
 
     conn = get_db()
@@ -187,7 +261,7 @@ def activate():
         return jsonify({
             "valid": False,
             "pro": False,
-            "message": "Invalid license key"
+            "message": "Invalid license key",
         })
 
     if int(license_row["active"]) != 1:
@@ -195,22 +269,21 @@ def activate():
         return jsonify({
             "valid": False,
             "pro": False,
-            "message": "License disabled"
+            "message": "License disabled",
         })
 
     cur.execute(
         "SELECT * FROM activations WHERE license_key = ? AND device_id = ?",
-        (key, device_id)
+        (key, device_id),
     )
     existing_device = cur.fetchone()
 
     if not existing_device:
         cur.execute(
             "SELECT COUNT(*) FROM activations WHERE license_key = ?",
-            (key,)
+            (key,),
         )
         current_devices = int(cur.fetchone()[0])
-
         max_devices = int(license_row["max_devices"])
 
         if current_devices >= max_devices:
@@ -218,12 +291,12 @@ def activate():
             return jsonify({
                 "valid": False,
                 "pro": False,
-                "message": "Device limit reached"
+                "message": "Device limit reached",
             })
 
         cur.execute(
             "INSERT INTO activations (license_key, device_id, activated_at) VALUES (?, ?, ?)",
-            (key, device_id, now())
+            (key, device_id, now()),
         )
         conn.commit()
 
@@ -232,7 +305,7 @@ def activate():
     return jsonify({
         "valid": True,
         "pro": True,
-        "message": "PRO activated"
+        "message": "PRO activated",
     })
 
 
@@ -264,23 +337,27 @@ def check():
         return jsonify({
             "valid": True,
             "pro": True,
-            "message": "License valid"
+            "message": "License valid",
         })
 
     return jsonify({
         "valid": False,
         "pro": False,
-        "message": "License not active on this device"
+        "message": "License not active on this device",
     })
 
 
 @app.route("/admin/create-license", methods=["POST", "GET"])
 def admin_create_license():
-
     data = request.get_json(silent=True) or {}
 
-    customer_email = str(data.get("customer_email", request.args.get("email", ""))).strip()
-    customer_name = str(data.get("customer_name", request.args.get("name", ""))).strip()
+    customer_email = str(
+        data.get("customer_email", request.args.get("email", ""))
+    ).strip()
+
+    customer_name = str(
+        data.get("customer_name", request.args.get("name", ""))
+    ).strip()
 
     license_row, created = create_license(
         customer_email=customer_email,
@@ -291,13 +368,12 @@ def admin_create_license():
 
     return jsonify({
         "created": created,
-        "license": license_row
+        "license": license_row,
     })
 
 
 @app.route("/gumroad/ping", methods=["POST"])
 def gumroad_ping():
-
     init_db()
 
     secret = request.form.get("secret", "")
@@ -306,7 +382,7 @@ def gumroad_ping():
     if secret != expected_secret:
         return jsonify({
             "ok": False,
-            "message": "Invalid secret"
+            "message": "Invalid secret",
         }), 403
 
     customer_email = request.form.get("email", "").strip()
@@ -322,7 +398,7 @@ def gumroad_ping():
     return jsonify({
         "ok": True,
         "license_key": license_row["license_key"],
-        "created": created
+        "created": created,
     })
 
 
@@ -373,7 +449,7 @@ def gumroad_webhook():
         "created": created,
         "license_key": license_row["license_key"],
         "customer_email": customer_email,
-        "message": "License generated"
+        "message": "License generated",
     })
 
 
@@ -394,38 +470,8 @@ def admin_list():
 
     return jsonify({
         "licenses": licenses,
-        "activations": activations
+        "activations": activations,
     })
-
-
-@app.route("/api/preview", methods=["POST"])
-def preview():
-
-    data = request.json
-    url = data.get("url")
-
-    if not url:
-        return jsonify({"error": "Missing URL"}), 400
-
-    try:
-        ydl_opts = {
-            "quiet": True,
-            "extract_flat": False,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-
-        result = {
-            "title": info.get("title"),
-            "duration": info.get("duration"),
-            "thumbnail": info.get("thumbnail"),
-        }
-
-        return jsonify(result)
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
