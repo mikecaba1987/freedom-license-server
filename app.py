@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime
 import secrets
 import string
+import yt_dlp
 
 app = Flask(__name__)
 
@@ -398,5 +399,33 @@ def admin_list():
 
 
 if __name__ == "__main__":
+    @app.route("/api/preview", methods=["POST"])
+def preview():
+
+    data = request.json
+    url = data.get("url")
+
+    if not url:
+        return jsonify({"error": "Missing URL"}), 400
+
+    try:
+        ydl_opts = {
+            "quiet": True,
+            "extract_flat": False,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        result = {
+            "title": info.get("title"),
+            "duration": info.get("duration"),
+            "thumbnail": info.get("thumbnail"),
+        }
+
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
     init_db()
     app.run(host="127.0.0.1", port=5000, debug=True)
