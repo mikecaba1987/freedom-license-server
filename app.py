@@ -209,7 +209,7 @@ def preview():
 
         return jsonify({
             "title": title,
-            "duration": 0,
+            "duration": info.get("duration", 0),
             "thumbnail": thumbnail,
             "video_id": video_id,
         })
