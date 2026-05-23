@@ -269,19 +269,132 @@ def activate():
             "message": "Missing device ID",
         }), 400
 
+    # 1) First try Gumroad license verification.
+    # Put the real Gumroad product ID into Railway Variables as GUMROAD_PRODUCT_ID.
+    # Example format: WJ3xqLN8aPbnaTRsSrU8oA==
+    gumroad_product_id = os.getenv("GUMROAD_PRODUCT_ID", "").strip()
+
+    gumroad_valid = False
+    gumroad_message = ""
+    gumroad_sale_id = ""
+    customer_email = ""
+    customer_name = ""
+    product_name = "Freedom Downloader — Lifetime PRO"
+
+    if gumroad_product_id:
+        try:
+            payload = urllib.parse.urlencode({
+                "product_id": gumroad_product_id,
+                "license_key": key,
+                # Device limit is handled by our own SQLite table below.
+                # Keeping this false avoids increasing Gumroad uses every app start/retry.
+                "increment_uses_count": "false",
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                "https://api.gumroad.com/v2/licenses/verify",
+                data=payload,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "FreedomDownloader/1.0",
+                },
+                method="POST",
+            )
+
+            with urllib.request.urlopen(req, timeout=12) as response:
+                raw = response.read().decode("utf-8")
+                gumroad_data = json.loads(raw)
+
+            gumroad_valid = gumroad_data.get("success") is True
+            purchase = gumroad_data.get("purchase") or {}
+
+            if purchase.get("refunded") is True:
+                gumroad_valid = False
+                gumroad_message = "License refunded"
+
+            if purchase.get("chargebacked") is True:
+                gumroad_valid = False
+                gumroad_message = "License chargebacked"
+
+            gumroad_sale_id = str(
+                purchase.get("id")
+                or purchase.get("sale_id")
+                or ""
+            ).strip()
+
+            customer_email = str(
+                purchase.get("email")
+                or purchase.get("purchaser_email")
+                or ""
+            ).strip()
+
+            customer_name = str(
+                purchase.get("full_name")
+                or purchase.get("name")
+                or ""
+            ).strip()
+
+            product_name = str(
+                purchase.get("product_name")
+                or purchase.get("product_permalink")
+                or product_name
+            ).strip()
+
+            if not gumroad_valid and not gumroad_message:
+                gumroad_message = gumroad_data.get("message") or "Invalid Gumroad license key"
+
+        except Exception as e:
+            gumroad_valid = False
+            gumroad_message = "Gumroad verification failed"
+
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
-    license_row = cur.fetchone()
+    # 2) If Gumroad says valid, auto-create/cache this key in our local DB.
+    if gumroad_valid:
+        cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
+        license_row = cur.fetchone()
 
-    if not license_row:
-        conn.close()
-        return jsonify({
-            "valid": False,
-            "pro": False,
-            "message": "Invalid license key",
-        })
+        if not license_row:
+            cur.execute("""
+                INSERT INTO licenses (
+                    license_key,
+                    active,
+                    max_devices,
+                    customer_email,
+                    customer_name,
+                    source,
+                    gumroad_sale_id,
+                    product_name,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                key,
+                1,
+                2,
+                customer_email,
+                customer_name,
+                "gumroad_api",
+                gumroad_sale_id,
+                product_name,
+                now(),
+            ))
+            conn.commit()
+            cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
+            license_row = cur.fetchone()
+    else:
+        # 3) Fallback: keep old manual FD keys working too.
+        cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
+        license_row = cur.fetchone()
+
+        if not license_row:
+            conn.close()
+            return jsonify({
+                "valid": False,
+                "pro": False,
+                "message": gumroad_message or "Invalid license key",
+            })
 
     if int(license_row["active"]) != 1:
         conn.close()
@@ -326,7 +439,6 @@ def activate():
         "pro": True,
         "message": "PRO activated",
     })
-
 
 @app.route("/check", methods=["POST"])
 def check():
