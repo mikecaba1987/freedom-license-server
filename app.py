@@ -345,7 +345,7 @@ def activate():
 
         except Exception as e:
             gumroad_valid = False
-            gumroad_message = "Gumroad verification failed"
+            gumroad_message = "Gumroad error: " + str(e)
 
     conn = get_db()
     cur = conn.cursor()
