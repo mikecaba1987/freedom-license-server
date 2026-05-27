@@ -154,52 +154,72 @@ def extract_youtube_id(url):
 
 
 def verify_gumroad_license(key):
-    gumroad_product_id = os.getenv("GUMROAD_PRODUCT_ID", "").strip()
-    if not gumroad_product_id:
-        return False, "Missing GUMROAD_PRODUCT_ID", {}
 
-    payload = urllib.parse.urlencode({
-        "product_id": gumroad_product_id,
-        "license_key": key,
-        "increment_uses_count": "false",
-    }).encode("utf-8")
+    product_ids = [
+        os.getenv("GUMROAD_PRODUCT_ID", "").strip(),
+        os.getenv("GUMROAD_PRODUCT_ID_1_SONG", "").strip(),
+        os.getenv("GUMROAD_PRODUCT_ID_3_SONGS", "").strip(),
+        os.getenv("GUMROAD_PRODUCT_ID_LIFETIME", "").strip(),
+    ]
 
-    req = urllib.request.Request(
-        "https://api.gumroad.com/v2/licenses/verify",
-        data=payload,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "FreedomDownloader/1.0",
-        },
-        method="POST",
-    )
+    product_ids = [p for p in product_ids if p]
 
-    try:
-        with urllib.request.urlopen(req, timeout=12) as response:
-            raw = response.read().decode("utf-8")
-            gumroad_data = json.loads(raw)
-    except urllib.error.HTTPError as e:
+    if not product_ids:
+        return False, "Missing Gumroad product IDs", {}
+
+    last_message = "Invalid Gumroad license key"
+
+    for product_id in product_ids:
+
+        payload = urllib.parse.urlencode({
+            "product_id": product_id,
+            "license_key": key,
+            "increment_uses_count": "false",
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.gumroad.com/v2/licenses/verify",
+            data=payload,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "FreedomDownloader/1.0",
+            },
+            method="POST",
+        )
+
         try:
-            body = e.read().decode("utf-8")
-        except Exception:
-            body = ""
-        return False, f"Gumroad HTTP {e.code}: {body or e.reason}", {}
-    except Exception as e:
-        return False, "Gumroad error: " + str(e), {}
+            with urllib.request.urlopen(req, timeout=12) as response:
+                raw = response.read().decode("utf-8")
+                gumroad_data = json.loads(raw)
 
-    if gumroad_data.get("success") is not True:
-        return False, gumroad_data.get("message") or "Invalid Gumroad license key", gumroad_data
+            if gumroad_data.get("success") is True:
 
-    purchase = gumroad_data.get("purchase") or {}
+                purchase = gumroad_data.get("purchase") or {}
 
-    if purchase.get("refunded") is True:
-        return False, "License refunded", gumroad_data
+                if purchase.get("refunded") is True:
+                    return False, "License refunded", gumroad_data
 
-    if purchase.get("chargebacked") is True:
-        return False, "License chargebacked", gumroad_data
+                if purchase.get("chargebacked") is True:
+                    return False, "License chargebacked", gumroad_data
 
-    return True, "Gumroad license valid", gumroad_data
+                return True, "Gumroad license valid", gumroad_data
 
+            last_message = gumroad_data.get("message") or last_message
+
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8")
+                body_data = json.loads(body)
+                last_message = body_data.get("message") or body
+            except Exception:
+                last_message = f"Gumroad HTTP {e.code}: {e.reason}"
+            continue
+
+        except Exception as e:
+            last_message = "Gumroad error: " + str(e)
+            continue
+
+    return False, last_message, {}
 
 def activate_local_license(key, device_id, gumroad_data=None):
     init_db()
