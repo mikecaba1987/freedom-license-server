@@ -3,9 +3,11 @@ import json
 import sqlite3
 import secrets
 import string
+import smtplib
 import urllib.parse
 import urllib.request
 import urllib.error
+from email.message import EmailMessage
 from pathlib import Path
 from datetime import datetime
 
@@ -24,8 +26,7 @@ def generate_license_key():
     alphabet = string.ascii_uppercase + string.digits
     parts = []
     for _ in range(4):
-        part = "".join(secrets.choice(alphabet) for _ in range(5))
-        parts.append(part)
+        parts.append("".join(secrets.choice(alphabet) for _ in range(5)))
     return "FD-" + "-".join(parts)
 
 
@@ -65,6 +66,18 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS webhook_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider TEXT DEFAULT 'gumroad',
+        sale_id TEXT DEFAULT '',
+        email TEXT DEFAULT '',
+        product_name TEXT DEFAULT '',
+        payload TEXT DEFAULT '',
+        created_at TEXT DEFAULT ''
+    )
+    """)
+
     columns = [row["name"] for row in cur.execute("PRAGMA table_info(licenses)").fetchall()]
     extra_columns = {
         "customer_name": "TEXT DEFAULT ''",
@@ -83,26 +96,61 @@ def init_db():
     conn.close()
 
 
-def product_download_limit(product_name):
-    value = (product_name or "").lower()
+def row_to_dict(row):
+    return dict(row) if row else None
 
-    if "lifetime" in value or "freedom-lifetime-pro" in value:
+
+def normalize_text(value):
+    return str(value or "").strip()
+
+
+def product_download_limit(product_name):
+    value = normalize_text(product_name).lower()
+
+    if "lifetime" in value or "doživot" in value or "freedom-lifetime-pro" in value:
         return -1
 
     if "3 song" in value or "3-song" in value or "three" in value or "freedom-3-songs" in value:
         return 3
 
-    if "1 song" in value or "1-song" in value or "one" in value or "freedom-1-song" in value:
+    if "1 song" in value or "1-song" in value or "one" in value or "1 download" in value or "freedom-1-song" in value:
         return 1
 
-    # Safe default for paid keys where Gumroad does not return a name.
     return -1
 
 
-def create_license(customer_email="", customer_name="", source="manual", gumroad_sale_id="", product_name="", max_devices=2, downloads_limit=-1):
+def save_webhook_event(data):
+    conn = get_db()
+    cur = conn.cursor()
+    sale_id = normalize_text(data.get("sale_id") or data.get("id") or data.get("order_id"))
+    email = normalize_text(data.get("email") or data.get("purchaser_email") or data.get("customer_email"))
+    product_name = normalize_text(data.get("product_name") or data.get("product_permalink") or data.get("permalink"))
+    cur.execute("""
+        INSERT INTO webhook_events (provider, sale_id, email, product_name, payload, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, ("gumroad", sale_id, email, product_name, json.dumps(data, ensure_ascii=False), now()))
+    conn.commit()
+    conn.close()
+
+
+def create_license(
+    customer_email="",
+    customer_name="",
+    source="manual",
+    gumroad_sale_id="",
+    product_name="",
+    max_devices=2,
+    downloads_limit=-1,
+):
     init_db()
     conn = get_db()
     cur = conn.cursor()
+
+    customer_email = normalize_text(customer_email).lower()
+    customer_name = normalize_text(customer_name)
+    source = normalize_text(source)
+    gumroad_sale_id = normalize_text(gumroad_sale_id)
+    product_name = normalize_text(product_name)
 
     if gumroad_sale_id:
         cur.execute("SELECT * FROM licenses WHERE gumroad_sale_id = ?", (gumroad_sale_id,))
@@ -111,7 +159,19 @@ def create_license(customer_email="", customer_name="", source="manual", gumroad
             conn.close()
             return dict(existing), False
 
-    for _ in range(20):
+    # Fallback idempotency for Gumroad test pings that sometimes have no sale id.
+    if source.startswith("gumroad") and customer_email and product_name:
+        cur.execute("""
+            SELECT * FROM licenses
+            WHERE customer_email = ? AND product_name = ? AND source LIKE 'gumroad%'
+            ORDER BY id DESC LIMIT 1
+        """, (customer_email, product_name))
+        existing = cur.fetchone()
+        if existing:
+            conn.close()
+            return dict(existing), False
+
+    for _ in range(50):
         key = generate_license_key()
         try:
             cur.execute("""
@@ -137,6 +197,75 @@ def create_license(customer_email="", customer_name="", source="manual", gumroad
     raise RuntimeError("Could not generate unique license key")
 
 
+def send_license_email(to_email, customer_name, license_key, product_name):
+    """
+    Optional SMTP email sender.
+    Set these Railway variables to enable it:
+    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM
+    Without SMTP it safely does nothing and the license is still generated.
+    """
+    to_email = normalize_text(to_email)
+    if not to_email:
+        return False, "Missing customer email"
+
+    smtp_host = normalize_text(os.getenv("SMTP_HOST"))
+    smtp_port = int(os.getenv("SMTP_PORT", "587"))
+    smtp_user = normalize_text(os.getenv("SMTP_USER"))
+    smtp_pass = normalize_text(os.getenv("SMTP_PASS"))
+    smtp_from = normalize_text(os.getenv("SMTP_FROM") or smtp_user)
+
+    if not smtp_host or not smtp_user or not smtp_pass or not smtp_from:
+        return False, "SMTP not configured"
+
+    name = customer_name or "there"
+    product = product_name or "Freedom Downloader PRO"
+
+    msg = EmailMessage()
+    msg["Subject"] = "Your Freedom Downloader PRO license key"
+    msg["From"] = smtp_from
+    msg["To"] = to_email
+    msg.set_content(f"""Hi {name},
+
+Thank you for purchasing {product}.
+
+Your PRO license key:
+
+{license_key}
+
+How to activate:
+1. Install the APK from Gumroad.
+2. Open Freedom Downloader.
+3. Paste this license key.
+4. Tap Activate.
+
+Enjoy 👑
+Freedom Downloader
+""")
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return True, "Email sent"
+    except Exception as e:
+        return False, str(e)
+
+
+def gumroad_payload():
+    if request.is_json:
+        return request.get_json(silent=True) or {}
+    return request.form.to_dict(flat=True)
+
+
+def valid_gumroad_secret(data):
+    expected = normalize_text(os.getenv("GUMROAD_SECRET"))
+    if not expected:
+        return True
+    incoming = normalize_text(data.get("secret") or data.get("seller_id"))
+    return incoming == expected
+
+
 def extract_youtube_id(url):
     parsed = urllib.parse.urlparse(url)
 
@@ -154,14 +283,12 @@ def extract_youtube_id(url):
 
 
 def verify_gumroad_license(key):
-
     product_ids = [
         os.getenv("GUMROAD_PRODUCT_ID", "").strip(),
         os.getenv("GUMROAD_PRODUCT_ID_1_SONG", "").strip(),
         os.getenv("GUMROAD_PRODUCT_ID_3_SONGS", "").strip(),
         os.getenv("GUMROAD_PRODUCT_ID_LIFETIME", "").strip(),
     ]
-
     product_ids = [p for p in product_ids if p]
 
     if not product_ids:
@@ -170,7 +297,6 @@ def verify_gumroad_license(key):
     last_message = "Invalid Gumroad license key"
 
     for product_id in product_ids:
-
         payload = urllib.parse.urlencode({
             "product_id": product_id,
             "license_key": key,
@@ -193,15 +319,11 @@ def verify_gumroad_license(key):
                 gumroad_data = json.loads(raw)
 
             if gumroad_data.get("success") is True:
-
                 purchase = gumroad_data.get("purchase") or {}
-
                 if purchase.get("refunded") is True:
                     return False, "License refunded", gumroad_data
-
                 if purchase.get("chargebacked") is True:
                     return False, "License chargebacked", gumroad_data
-
                 return True, "Gumroad license valid", gumroad_data
 
             last_message = gumroad_data.get("message") or last_message
@@ -214,29 +336,32 @@ def verify_gumroad_license(key):
             except Exception:
                 last_message = f"Gumroad HTTP {e.code}: {e.reason}"
             continue
-
         except Exception as e:
             last_message = "Gumroad error: " + str(e)
             continue
 
     return False, last_message, {}
 
+
 def activate_local_license(key, device_id, gumroad_data=None):
     init_db()
     conn = get_db()
     cur = conn.cursor()
 
+    key = normalize_text(key)
+    device_id = normalize_text(device_id)
+
     if gumroad_data:
         purchase = gumroad_data.get("purchase") or {}
-        gumroad_sale_id = str(purchase.get("id") or purchase.get("sale_id") or "").strip()
-        customer_email = str(purchase.get("email") or purchase.get("purchaser_email") or "").strip()
-        customer_name = str(purchase.get("full_name") or purchase.get("name") or "").strip()
-        product_name = str(
+        gumroad_sale_id = normalize_text(purchase.get("id") or purchase.get("sale_id"))
+        customer_email = normalize_text(purchase.get("email") or purchase.get("purchaser_email")).lower()
+        customer_name = normalize_text(purchase.get("full_name") or purchase.get("name"))
+        product_name = normalize_text(
             purchase.get("product_name")
             or purchase.get("product_permalink")
             or purchase.get("permalink")
             or "Freedom Downloader"
-        ).strip()
+        )
         downloads_limit = product_download_limit(product_name)
 
         cur.execute("SELECT * FROM licenses WHERE license_key = ?", (key,))
@@ -309,13 +434,17 @@ def activate_local_license(key, device_id, gumroad_data=None):
 @app.route("/", methods=["GET"])
 def home():
     init_db()
-    return jsonify({"name": "Freedom Downloader License Server", "status": "online"})
+    return jsonify({
+        "name": "Freedom Downloader License Server",
+        "status": "online",
+        "gumroad_webhook": "/gumroad/webhook",
+    })
 
 
 @app.route("/api/preview", methods=["POST"])
 def preview():
     data = request.get_json(silent=True) or {}
-    url = str(data.get("url", "")).strip()
+    url = normalize_text(data.get("url"))
     if not url:
         return jsonify({"error": "Missing URL"}), 400
 
@@ -329,10 +458,10 @@ def preview():
 
         title = info.get("title", "YouTube Audio Preview")
         thumbnail = info.get("thumbnail_url", "") or (f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg" if video_id else "")
-        return jsonify({"title": title, "duration": 0, "thumbnail": thumbnail, "video_id": video_id})
+        return jsonify({"title": title, "duration": None, "thumbnail": thumbnail, "video_id": video_id})
     except Exception:
         thumbnail = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg" if video_id else ""
-        return jsonify({"title": "YouTube Audio Preview", "duration": 0, "thumbnail": thumbnail, "video_id": video_id})
+        return jsonify({"title": "Media Preview", "duration": None, "thumbnail": thumbnail, "video_id": video_id})
 
 
 @app.route("/api/download-pro", methods=["GET"])
@@ -346,8 +475,8 @@ def download_pro():
 @app.route("/activate", methods=["POST"])
 def activate():
     data = request.get_json(silent=True) or {}
-    key = str(data.get("key", "")).strip()
-    device_id = str(data.get("device_id", "")).strip()
+    key = normalize_text(data.get("key"))
+    device_id = normalize_text(data.get("device_id"))
 
     if not key:
         return jsonify({"valid": False, "pro": False, "message": "Missing license key"}), 400
@@ -385,8 +514,8 @@ def activate():
 def consume_download():
     init_db()
     data = request.get_json(silent=True) or {}
-    key = str(data.get("key", "")).strip()
-    device_id = str(data.get("device_id", "")).strip()
+    key = normalize_text(data.get("key"))
+    device_id = normalize_text(data.get("device_id"))
 
     if not key or not device_id:
         return jsonify({"allowed": False, "message": "Missing license or device"}), 400
@@ -441,8 +570,8 @@ def consume_download():
 def check():
     init_db()
     data = request.get_json(silent=True) or {}
-    key = str(data.get("key", "")).strip()
-    device_id = str(data.get("device_id", "")).strip()
+    key = normalize_text(data.get("key"))
+    device_id = normalize_text(data.get("device_id"))
 
     conn = get_db()
     cur = conn.cursor()
@@ -465,13 +594,16 @@ def check():
 @app.route("/admin/create-license", methods=["POST", "GET"])
 def admin_create_license():
     data = request.get_json(silent=True) or {}
-    customer_email = str(data.get("customer_email", request.args.get("email", ""))).strip()
-    customer_name = str(data.get("customer_name", request.args.get("name", ""))).strip()
-    limit = int(request.args.get("limit", data.get("downloads_limit", -1)))
+    customer_email = normalize_text(data.get("customer_email", request.args.get("email", "")))
+    customer_name = normalize_text(data.get("customer_name", request.args.get("name", "")))
+    product_name = normalize_text(data.get("product_name", request.args.get("product", "Freedom Downloader Lifetime PRO")))
+    limit = int(request.args.get("limit", data.get("downloads_limit", product_download_limit(product_name))))
+
     license_row, created = create_license(
         customer_email=customer_email,
         customer_name=customer_name,
         source="manual",
+        product_name=product_name,
         max_devices=2,
         downloads_limit=limit,
     )
@@ -487,32 +619,48 @@ def admin_list():
     licenses = [dict(row) for row in cur.fetchall()]
     cur.execute("SELECT * FROM activations ORDER BY id DESC")
     activations = [dict(row) for row in cur.fetchall()]
+    cur.execute("SELECT * FROM webhook_events ORDER BY id DESC LIMIT 50")
+    events = [dict(row) for row in cur.fetchall()]
     conn.close()
-    return jsonify({"licenses": licenses, "activations": activations})
+    return jsonify({"licenses": licenses, "activations": activations, "webhook_events": events})
 
 
 @app.route("/gumroad/ping", methods=["POST"])
-def gumroad_ping():
-    init_db()
-    secret = request.form.get("secret", "")
-    expected_secret = os.getenv("GUMROAD_SECRET", "")
-    if secret != expected_secret:
-        return jsonify({"ok": False, "message": "Invalid secret"}), 403
-
-    customer_email = request.form.get("email", "").strip()
-    customer_name = request.form.get("full_name", "").strip()
-    license_row, created = create_license(customer_email=customer_email, customer_name=customer_name, source="gumroad", max_devices=2)
-    return jsonify({"ok": True, "license_key": license_row["license_key"], "created": created})
-
-
 @app.route("/gumroad/webhook", methods=["POST"])
+@app.route("/gumroad-webhook", methods=["POST"])
 def gumroad_webhook():
     init_db()
-    data = request.form.to_dict()
-    customer_email = str(data.get("email") or data.get("purchaser_email") or data.get("customer_email") or "").strip()
-    customer_name = str(data.get("full_name") or data.get("name") or data.get("customer_name") or "").strip()
-    gumroad_sale_id = str(data.get("sale_id") or data.get("id") or data.get("order_id") or "").strip()
-    product_name = str(data.get("product_name") or data.get("product_permalink") or "").strip()
+    data = gumroad_payload()
+
+    if not valid_gumroad_secret(data):
+        return jsonify({"ok": False, "message": "Invalid Gumroad secret"}), 403
+
+    save_webhook_event(data)
+
+    customer_email = normalize_text(
+        data.get("email")
+        or data.get("purchaser_email")
+        or data.get("customer_email")
+    ).lower()
+    customer_name = normalize_text(
+        data.get("full_name")
+        or data.get("name")
+        or data.get("customer_name")
+    )
+    gumroad_sale_id = normalize_text(
+        data.get("sale_id")
+        or data.get("id")
+        or data.get("order_id")
+    )
+    product_name = normalize_text(
+        data.get("product_name")
+        or data.get("product_permalink")
+        or data.get("permalink")
+        or "Freedom Downloader Lifetime PRO"
+    )
+
+    downloads_limit = product_download_limit(product_name)
+
     license_row, created = create_license(
         customer_email=customer_email,
         customer_name=customer_name,
@@ -520,11 +668,30 @@ def gumroad_webhook():
         gumroad_sale_id=gumroad_sale_id,
         product_name=product_name,
         max_devices=2,
-        downloads_limit=product_download_limit(product_name),
+        downloads_limit=downloads_limit,
     )
-    return jsonify({"ok": True, "created": created, "license_key": license_row["license_key"], "customer_email": customer_email, "message": "License generated"})
+
+    email_sent, email_message = send_license_email(
+        customer_email,
+        customer_name,
+        license_row["license_key"],
+        product_name,
+    )
+
+    return jsonify({
+        "ok": True,
+        "created": created,
+        "license_key": license_row["license_key"],
+        "customer_email": customer_email,
+        "product_name": product_name,
+        "downloads_limit": downloads_limit,
+        "email_sent": email_sent,
+        "email_message": email_message,
+        "message": "License generated",
+    })
 
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
